@@ -32,7 +32,14 @@ mqtt:
 # ----- Processing mode -----
 processing:
   mode: "batch"               # "batch" = process all files once
-  output_hz: 1.0              # Output feature vector rate (Hz)
+  output_step_seconds: 2.5    # 5s windows with 50% overlap -> one vector per 2.5s
+
+# ----- Model input preparation -----
+model_input:
+  scaler_path: "models/scaler.joblib"
+  clip_min: -10.0
+  clip_max: 10.0
+  expected_group_order: [bearing, nacelle, tower, slow]
 
 # ----- Signal preprocessing -----
 preprocessing:

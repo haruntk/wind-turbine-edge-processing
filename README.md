@@ -23,7 +23,7 @@ Real-time predictive maintenance system for wind turbines using edge computing a
 - **426-Dimensional Feature Vectors**: FFT spectral + time-domain feature extraction
 - **Multi-Rate Sensor Fusion**: Bearing (74 kHz), Nacelle (37 kHz), Tower (2.96 kHz), Slow (1.48 kHz)
 - **50% Overlapping Windows**: 1s windows for high-freq, 5s for low-freq sensors
-- **Zero-Order Hold Alignment**: Multi-rate output synchronized to 1 Hz timeline
+- **Window-Step Feature Rows**: One original 5s/50% overlap vector per window, no hold duplicates
 - **TimescaleDB Storage**: Hypertable-backed time-series storage with compression
 
 ## Dataset

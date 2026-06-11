@@ -4,8 +4,8 @@ Each ``ChannelGroup`` represents a set of sensors that share the same
 native sampling rate and are processed with a common windowing strategy.
 The four groups match the Fraunhofer LBF dataset structure:
 
-- **bearing** (6 ch @ 74 kHz, 1 s window, FFT → 16 features/ch)
-- **nacelle** (3 ch @ 37 kHz, 1 s window, FFT → 15 features/ch)
+- **bearing** (6 ch @ 74 kHz, 5 s window, FFT → 16 features/ch)
+- **nacelle** (3 ch @ 37 kHz, 5 s window, FFT → 15 features/ch)
 - **tower_tach** (13 ch @ 2.96 kHz, 5 s window, FFT → 15 features/ch)
 - **slow** (6 ch @ 1.48 kHz, 5 s window, Time-domain → 15 features/ch)
 """

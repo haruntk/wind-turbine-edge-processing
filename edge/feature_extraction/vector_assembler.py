@@ -1,26 +1,24 @@
-"""426-dimensional feature vector assembly with multi-rate alignment.
+"""426-dimensional model-input feature vector assembly.
 
 Orchestrates the full per-file processing flow:
   1. Preprocess each channel (detrend, optional bandstop)
   2. Window each group at its native rate with 50 % overlap
   3. Extract features (FFT spectral or time-domain)
-  4. Align groups to a common 1 Hz timeline via zero-order hold
-  5. Downsample to produce exactly 1 vector per second
+  4. Concatenate groups by matching window_id, without hold/resampling
 
 The output is a sequence of ``np.ndarray`` of shape ``(426,)``
 in deterministic column order:
   ``[bearing_96 | nacelle_45 | tower_195 | slow_90]``
-
-Per project report §A.4.2.2:
-  "5 saniyelik pencerelerden elde edilen özellikler ise yeni bir pencere
-   oluşana kadar ara zaman adımlarında korunarak ortak sekans yapısına
-   hizalanmıştır."
 """
 
 from __future__ import annotations
 
 from collections import OrderedDict
-from typing import Any, Iterator
+from functools import lru_cache
+import os
+import pickle
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -38,6 +36,37 @@ _LOG = get_logger(__name__)
 
 # Expected total feature count
 EXPECTED_FEATURE_DIM = 426
+EXPECTED_MODEL_GROUP_ORDER = ("bearing", "nacelle", "tower", "slow")
+
+
+def _model_group_name(group_name: str) -> str:
+    """Return the model/training name for a configured sensor group."""
+    if group_name == "tower_tach":
+        return "tower"
+    return group_name
+
+
+def _assert_model_feature_order(
+    groups: list[ChannelGroup],
+    config: dict[str, Any],
+) -> None:
+    """Assert DB vector order matches the training/model group order."""
+    expected_order = tuple(
+        config.get("model_input", {}).get(
+            "expected_group_order",
+            EXPECTED_MODEL_GROUP_ORDER,
+        )
+    )
+    actual_order = tuple(_model_group_name(group.name) for group in groups)
+    assert actual_order == expected_order, (
+        "Feature group order must match training columns: "
+        f"expected {expected_order}, got {actual_order}."
+    )
+
+    actual_dim = sum(group.total_features for group in groups)
+    assert actual_dim == EXPECTED_FEATURE_DIM, (
+        f"Feature dimension must remain {EXPECTED_FEATURE_DIM}, got {actual_dim}."
+    )
 
 
 def _extract_windows_for_group(
@@ -145,18 +174,126 @@ def _compute_group_feature_table(
     return table
 
 
-def _window_time_seconds(
-    window_id: int,
-    group: ChannelGroup,
-    overlap_ratio: float,
+def get_feature_step_seconds(
+    groups: list[ChannelGroup],
+    config: dict[str, Any],
 ) -> float:
-    """Compute the centre time (in seconds) of window *window_id*."""
-    step_samples = int(
-        round(group.window_size_samples * (1.0 - overlap_ratio))
+    """Return the shared model-vector timestamp step in seconds."""
+    overlap_ratio: float = config.get("windowing", {}).get(
+        "overlap_ratio", 0.5
     )
-    start_sample = window_id * step_samples
-    centre_sample = start_sample + group.window_size_samples / 2.0
-    return centre_sample / group.sampling_rate_hz
+    steps = [
+        group.window_size_seconds * (1.0 - overlap_ratio)
+        for group in groups
+    ]
+    rounded_steps = {round(step, 9) for step in steps}
+    assert len(rounded_steps) == 1, (
+        "All groups must use the same window step before DB insertion; "
+        f"got {steps}."
+    )
+    configured_step = config.get("processing", {}).get("output_step_seconds")
+    if configured_step is not None:
+        assert round(float(configured_step), 9) == round(float(steps[0]), 9), (
+            "processing.output_step_seconds must match the configured "
+            f"window step: expected {steps[0]}, got {configured_step}."
+        )
+    return float(steps[0])
+
+
+def _get_scaler_path(config: dict[str, Any]) -> str:
+    """Read the saved training scaler path from config or environment."""
+    model_cfg = config.get("model_input", {})
+    scaler_path = str(model_cfg.get("scaler_path") or "").strip()
+    if scaler_path:
+        return scaler_path
+    return os.environ.get("FEATURE_SCALER_PATH", "").strip()
+
+
+@lru_cache(maxsize=4)
+def _load_training_scaler(scaler_path: str) -> Any:
+    """Load the fitted RobustScaler without fitting anything at the edge."""
+    path = Path(scaler_path).expanduser()
+    if not path.exists():
+        raise FileNotFoundError(f"Training scaler file not found: {path}")
+
+    try:
+        import joblib
+
+        return joblib.load(path)
+    except ImportError:
+        with path.open("rb") as fh:
+            return pickle.load(fh)
+
+
+def _fill_missing_like_training(matrix: np.ndarray) -> np.ndarray:
+    """Apply inf->nan, ffill, bfill, fillna(0) column-wise."""
+    filled = np.asarray(matrix, dtype=np.float64).copy()
+    filled[~np.isfinite(filled)] = np.nan
+
+    if filled.size == 0:
+        return filled
+
+    row_idx = np.arange(filled.shape[0])[:, None]
+    col_idx = np.arange(filled.shape[1])
+
+    # Same intent as pandas ffill: each NaN takes the previous valid row.
+    valid = ~np.isnan(filled)
+    forward_idx = np.where(valid, row_idx, 0)
+    np.maximum.accumulate(forward_idx, axis=0, out=forward_idx)
+    filled = filled[forward_idx, col_idx]
+
+    # Same intent as pandas bfill: remaining leading NaNs take next valid row.
+    valid = ~np.isnan(filled)
+    backward_idx = np.where(valid, row_idx, filled.shape[0] - 1)
+    backward_idx = np.minimum.accumulate(backward_idx[::-1], axis=0)[::-1]
+    filled = filled[backward_idx, col_idx]
+
+    return np.nan_to_num(filled, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def prepare_vectors_for_model_db(
+    vectors: list[np.ndarray],
+    config: dict[str, Any],
+) -> list[np.ndarray]:
+    """Make raw 426-dim vectors model-ready before they are written to DB.
+
+    This mirrors training preprocessing exactly at the edge boundary:
+    missing-value fill -> saved RobustScaler.transform -> clip. The scaler is
+    never fit here; inference can therefore read DB rows without extra work.
+    """
+    if not vectors:
+        return []
+
+    matrix = np.asarray(vectors, dtype=np.float64)
+    if matrix.ndim != 2 or matrix.shape[1] != EXPECTED_FEATURE_DIM:
+        raise ValueError(
+            "Expected a 2-D feature matrix with "
+            f"{EXPECTED_FEATURE_DIM} columns, got shape {matrix.shape}."
+        )
+
+    scaler_path = _get_scaler_path(config)
+    if not scaler_path:
+        raise ValueError(
+            "Missing training scaler path. Set model_input.scaler_path "
+            "or FEATURE_SCALER_PATH."
+        )
+
+    scaler = _load_training_scaler(scaler_path)
+    n_features = getattr(scaler, "n_features_in_", EXPECTED_FEATURE_DIM)
+    assert n_features == EXPECTED_FEATURE_DIM, (
+        "Training scaler feature count does not match DB vector width: "
+        f"expected {EXPECTED_FEATURE_DIM}, got {n_features}."
+    )
+
+    matrix = _fill_missing_like_training(matrix)
+    scaled = scaler.transform(matrix)
+
+    model_cfg = config.get("model_input", {})
+    clip_min = float(model_cfg.get("clip_min", -10.0))
+    clip_max = float(model_cfg.get("clip_max", 10.0))
+    clipped = np.clip(scaled, clip_min, clip_max)
+
+    return [row.astype(np.float64, copy=False) for row in clipped]
 
 
 # ------------------------------------------------------------------
@@ -168,18 +305,14 @@ def assemble_feature_vectors(
     groups: list[ChannelGroup],
     config: dict[str, Any],
 ) -> list[np.ndarray]:
-    """Assemble 426-dim feature vectors at 1 Hz from raw channel signals.
+    """Assemble one 426-dim feature vector per analysis window.
 
     Processing steps:
       1. For each sensor group: preprocess → window (50 % overlap) →
          extract features → produce per-window feature rows.
-      2. Compute a time axis in seconds for each group's windows.
-      3. Determine full integer-second timeline from the shortest group.
-      4. For each integer second *t*:
-         - Fast groups (1 s window): take the window closest to *t*.
-         - Slow groups (5 s window): zero-order hold — use the most recent
-           window that starts at or before *t*.
-      5. Concatenate group features → 426-dim vector.
+      2. Assert group order is the model/training order.
+      3. Concatenate rows with the same window_id. No 1 Hz hold/resampling is
+         performed, so each DB row remains an original 5 s / 50 % window.
 
     Parameters
     ----------
@@ -194,96 +327,55 @@ def assemble_feature_vectors(
     -------
     list[np.ndarray]
         List of 1-D float64 arrays, each of length 426.
-        One vector per output second.
+        One vector per window step.
     """
-    overlap_ratio: float = config.get("windowing", {}).get(
-        "overlap_ratio", 0.5
-    )
+    _assert_model_feature_order(groups, config)
 
     # --- Step 1: Compute per-group feature tables ---
     group_tables: list[list[np.ndarray]] = []
-    group_times: list[list[float]] = []
 
     for group in groups:
         table = _compute_group_feature_table(signals, group, config)
-        times = [
-            _window_time_seconds(wid, group, overlap_ratio)
-            for wid in range(len(table))
-        ]
         group_tables.append(table)
-        group_times.append(times)
 
         _LOG.debug(
             "Group '%s': %d windows, %d features/window, "
-            "total span ≈ %.1f s",
+            "step %.3f s",
             group.name,
             len(table),
             group.total_features if table else 0,
-            times[-1] if times else 0.0,
+            get_feature_step_seconds([group], config),
         )
 
-    # --- Step 2: Determine output timeline (integer seconds) ---
-    if not any(group_tables):
+    # --- Step 2: Validate common window_id range ---
+    if not all(group_tables):
         _LOG.error("No features computed for any group.")
         return []
 
-    # Use the shortest signal duration to avoid extrapolation
-    max_times = []
-    for gt in group_times:
-        if gt:
-            max_times.append(gt[-1])
-    if not max_times:
-        return []
+    table_lengths = [len(table) for table in group_tables]
+    assert len(set(table_lengths)) == 1, (
+        "All groups must produce the same number of windows; "
+        f"got {dict(zip([group.name for group in groups], table_lengths))}."
+    )
+    n_windows = table_lengths[0]
 
-    duration_seconds = int(min(max_times))
-    if duration_seconds <= 0:
-        _LOG.warning("Signal too short for 1 Hz output.")
-        return []
-
-    output_seconds = list(range(duration_seconds))
     _LOG.info(
-        "Assembling %d feature vectors at 1 Hz (%.1f s signal).",
-        len(output_seconds),
-        duration_seconds,
+        "Assembling %d feature vectors at %.3f s/window step.",
+        n_windows,
+        get_feature_step_seconds(groups, config),
     )
 
-    # --- Step 3: For each second, pick the appropriate window ---
+    # --- Step 3: Concatenate matching window_id rows ---
     vectors: list[np.ndarray] = []
-    # Cache last-used index per group for zero-order-hold efficiency
-    last_idx = [0] * len(groups)
-
-    for t in output_seconds:
-        parts: list[np.ndarray] = []
-
-        for g_idx, (group, table, times) in enumerate(
-            zip(groups, group_tables, group_times)
-        ):
-            if not table:
-                # Group has no data — fill with zeros
-                parts.append(
-                    np.zeros(group.total_features, dtype=np.float64)
-                )
-                continue
-
-            # Find the window whose centre time is closest to (and ≤) t
-            # This implements zero-order hold for slow groups and nearest
-            # selection for fast groups.
-            best_idx = last_idx[g_idx]
-            for idx in range(best_idx, len(times)):
-                if times[idx] <= t + 0.5:
-                    best_idx = idx
-                else:
-                    break
-            last_idx[g_idx] = best_idx
-            parts.append(table[best_idx])
-
+    for window_id in range(n_windows):
+        parts = [table[window_id] for table in group_tables]
         vector = np.concatenate(parts)
 
         if len(vector) != EXPECTED_FEATURE_DIM:
             _LOG.error(
-                "Feature vector dimension mismatch at t=%d: "
+                "Feature vector dimension mismatch at window_id=%d: "
                 "expected %d, got %d.",
-                t,
+                window_id,
                 EXPECTED_FEATURE_DIM,
                 len(vector),
             )

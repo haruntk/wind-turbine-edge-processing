@@ -4,7 +4,7 @@ Entry point for the Jetson edge device.  Processes raw ``.mat`` files
 through the full pipeline:
 
     RAW DATA → PREPROCESS → WINDOW (50 % overlap) → FFT →
-    FEATURE EXTRACTION → 426-dim VECTOR (1 Hz) → TimescaleDB
+    FEATURE EXTRACTION → SCALED 426-dim VECTOR (2.5 s step) → TimescaleDB
 
 Usage::
 
@@ -38,6 +38,8 @@ from edge.data_sender.mqtt_publisher import MQTTPublisher
 from edge.feature_extraction.vector_assembler import (
     EXPECTED_FEATURE_DIM,
     assemble_feature_vectors,
+    get_feature_step_seconds,
+    prepare_vectors_for_model_db,
 )
 from edge.utils.logging import get_logger, setup_logging
 
@@ -151,9 +153,14 @@ def _process_file(
         _LOG.info("[DRY RUN] Skipping send.")
         return len(vectors)
 
+    # Persist only model-ready values: train-time fill -> saved scaler -> clip.
+    # Inference can then read DB rows directly without scaler/clip/dedup logic.
+    vectors = prepare_vectors_for_model_db(vectors, config)
+
     # Build records — each file gets a unique base time to avoid timestamp collisions
+    feature_step_seconds = get_feature_step_seconds(groups, config)
     base_time = datetime.now(tz=timezone.utc).replace(microsecond=0) - timedelta(
-        seconds=len(vectors)
+        seconds=len(vectors) * feature_step_seconds
     ) + timedelta(seconds=file_index * 1000)
 
     transport_cfg = config.get("mqtt", config.get("database", {}))
@@ -164,7 +171,7 @@ def _process_file(
     db_records: list[tuple[datetime, np.ndarray]] = []
 
     for idx, vector in enumerate(vectors):
-        ts = base_time + timedelta(seconds=idx)
+        ts = base_time + timedelta(seconds=idx * feature_step_seconds)
         if use_mqtt:
             mqtt_records.append((ts, vector, scenario_label))
             if len(mqtt_records) >= batch_size:
