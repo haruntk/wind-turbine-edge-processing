@@ -225,7 +225,7 @@ class InferenceService:
                     user=user,
                     password=pwd,
                 )
-                self.conn.autocommit = False
+                self.conn.autocommit = True
                 logger.info("Connected to database successfully.")
                 self.verify_schema()
                 break
@@ -278,14 +278,17 @@ class InferenceService:
             return [float(r[0]) for r in reversed(rows)]
 
     @torch.no_grad()
-    def predict_sequences(self, X: np.ndarray) -> np.ndarray:
-        """Runs batch model prediction and returns raw reconstruction errors."""
+    def predict_sequences(self, X: np.ndarray, batch_size: int = 128) -> np.ndarray:
+        """Runs batch model prediction and returns raw reconstruction errors in chunks."""
         self.model.eval()
-        x_tensor = torch.from_numpy(X).to(self.device)
-        recon = self.model(x_tensor)
-        # Average MSE loss per sequence over time steps (dim=1) and features (dim=2)
-        errors = ((recon - x_tensor) ** 2).mean(dim=(1, 2))
-        return errors.cpu().numpy()
+        errors = []
+        for i in range(0, len(X), batch_size):
+            chunk = X[i : i + batch_size]
+            x_tensor = torch.from_numpy(chunk).to(self.device)
+            recon = self.model(x_tensor)
+            err = ((recon - x_tensor) ** 2).mean(dim=(1, 2))
+            errors.extend(err.cpu().numpy().tolist())
+        return np.array(errors, dtype=np.float32)
 
     def process_data(self) -> datetime | None:
         """Fetches new feature vectors, runs inference, and writes results back."""
