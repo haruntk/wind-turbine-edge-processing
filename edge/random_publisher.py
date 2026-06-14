@@ -64,6 +64,24 @@ def main() -> None:
         default=1.0,
         help="Delay between publishing different files in seconds (default: 1.0)",
     )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["batch", "stream"],
+        default="batch",
+        help="Simulation mode: 'batch' (publish entire file at once) or 'stream' (publish vector-by-vector) (default: batch)",
+    )
+    parser.add_argument(
+        "--step-interval",
+        type=float,
+        default=1.0,
+        help="Delay between individual vector publications in stream mode in seconds (default: 1.0)",
+    )
+    parser.add_argument(
+        "--use-wall-time",
+        action="store_true",
+        help="Use current wall-clock time for each published vector's timestamp instead of simulated chronological clock.",
+    )
     args = parser.parse_args()
 
     # Register signal handlers for clean exit
@@ -83,9 +101,13 @@ def main() -> None:
     )
 
     _LOG.info("=" * 60)
-    _LOG.info("Wind Turbine Feature Vector Random Publisher Simulator (Instant Batch)")
+    _LOG.info(f"Wind Turbine Feature Vector Random Publisher Simulator ({args.mode.upper()} Mode)")
     _LOG.info("=" * 60)
-    _LOG.info(f"Delay between file loads: {args.interval} seconds")
+    if args.mode == "batch":
+        _LOG.info(f"Delay between file loads: {args.interval} seconds")
+    else:
+        _LOG.info(f"Delay between vector steps: {args.step_interval} seconds")
+        _LOG.info(f"Use wall time: {args.use_wall_time}")
 
     groups = load_groups_from_config(config)
     turbine_id = config.get("turbine", {}).get("id", "WT-001")
@@ -148,21 +170,36 @@ def main() -> None:
                     ts = current_sim_time + timedelta(seconds=idx * feature_step_seconds)
                     records.append((ts, vector, scenario_label))
                 
-                # Publish as fast as possible in batches
-                batch_size = int(config.get("mqtt", {}).get("batch_size", 50))
-                for i in range(0, len(records), batch_size):
-                    if _SHUTDOWN_REQUESTED:
-                        break
-                    batch = records[i : i + batch_size]
-                    sender.publish_feature_vectors_batch(batch)
-                
-                _LOG.info(f"Successfully published {len(vectors)} vectors | Time Range: {records[0][0].strftime('%H:%M:%S')} - {records[-1][0].strftime('%H:%M:%S')} | Scenario: {scenario_label}")
+                if args.mode == "stream":
+                    step_delay = args.step_interval if args.step_interval is not None else feature_step_seconds
+                    _LOG.info(f"Streaming {len(vectors)} vectors one by one with {step_delay}s delay between steps...")
+                    for idx, (ts, vector, label) in enumerate(records):
+                        if _SHUTDOWN_REQUESTED:
+                            break
+                        if args.use_wall_time:
+                            publish_ts = datetime.now(tz=timezone.utc).replace(microsecond=0)
+                        else:
+                            publish_ts = ts
+                        
+                        sender.publish_feature_vectors_batch([(publish_ts, vector, label)])
+                        _LOG.info(f"[{idx+1}/{len(vectors)}] Published vector | Timestamp: {publish_ts.strftime('%Y-%m-%d %H:%M:%S')} | Scenario: {label}")
+                        time.sleep(step_delay)
+                else:
+                    # Publish as fast as possible in batches
+                    batch_size = int(config.get("mqtt", {}).get("batch_size", 50))
+                    for i in range(0, len(records), batch_size):
+                        if _SHUTDOWN_REQUESTED:
+                            break
+                        batch = records[i : i + batch_size]
+                        sender.publish_feature_vectors_batch(batch)
+                    
+                    _LOG.info(f"Successfully published {len(vectors)} vectors | Time Range: {records[0][0].strftime('%H:%M:%S')} - {records[-1][0].strftime('%H:%M:%S')} | Scenario: {scenario_label}")
                 
                 # Advance simulation clock so next file follows chronologically
                 file_duration = len(vectors) * feature_step_seconds
                 current_sim_time += timedelta(seconds=file_duration)
                 
-                # Small delay between files to avoid saturating CPU
+                # Delay between files to avoid saturating CPU
                 time.sleep(args.interval)
                     
             except Exception as e:
